@@ -173,6 +173,14 @@ namespace UAssetGUI
             return FString.FromString(val.Replace("\\n", "\n").Replace("\\r", "\r"), encodingHeaderName.Equals(Encoding.Unicode.HeaderName) ? Encoding.Unicode : Encoding.UTF8);
         }
 
+        public static bool IsDiskFullException(IOException ex)
+        {
+            if (ex == null) return false;
+            int win32Code = ex.HResult & 0xFFFF;
+            if (win32Code == 0x70 /* ERROR_DISK_FULL */ || win32Code == 0x27 /* ERROR_HANDLE_DISK_FULL */) return true;
+            return ex.Message != null && ex.Message.IndexOf("not enough space", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
         public static bool DeleteDirectoryQuick(string path, bool recursive)
         {
             try

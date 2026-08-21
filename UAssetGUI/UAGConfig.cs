@@ -44,6 +44,7 @@ namespace UAssetGUI
         public bool AllowUntrustedScripts;
         public string RetocExtraCommands;
         public string GameSpecificOverride;
+        public string LastExtractFolder;
 
         public UAGConfigData()
         {
@@ -69,6 +70,7 @@ namespace UAssetGUI
             AllowUntrustedScripts = false;
             RetocExtraCommands = string.Empty;
             GameSpecificOverride = string.Empty;
+            LastExtractFolder = string.Empty;
         }
     }
 

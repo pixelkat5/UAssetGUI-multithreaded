@@ -8,6 +8,8 @@ using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text.RegularExpressions;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 using UAssetAPI;
 using UAssetAPI.UnrealTypes;
@@ -900,23 +902,88 @@ namespace UAssetGUI
             if (e.Node is PointingFileTreeNode ptn) InitializeChildren(ptn);
         }
 
-        private void ExtractVisit(DirectoryTreeItem processingNode, ProgressBarForm progressBarForm, FileStream stream2 = null, PakReader reader2 = null)
+        private void ExtractManyParallel(List<DirectoryTreeItem> roots, string outputDirectory)
         {
-            if (processingNode.IsFile)
+            List<DirectoryTreeItem> files = new List<DirectoryTreeItem>();
+            void Flatten(DirectoryTreeItem node)
             {
-                UAGConfig.ExtractFile(processingNode, this.InteropType, stream2, reader2);
-                extractAllBackgroundWorker.ReportProgress(0); // the percentage we pass in is unused
-                return;
+                if (node.IsFile) { files.Add(node); return; }
+                foreach (var child in node.Children) Flatten(child.Value);
+            }
+            foreach (var root in roots) Flatten(root);
+            int maxDegree = InteropType == InteropType.Retoc
+                ? Math.Max(1, Math.Min(Environment.ProcessorCount, 4))
+                : Math.Max(1, Environment.ProcessorCount);
+
+            ThreadLocal<(FileStream stream, PakReader reader)> threadLocalPak = InteropType == InteropType.Pak
+                ? new ThreadLocal<(FileStream, PakReader)>(() =>
+                {
+                    var stream = new FileStream(this.CurrentContainerPath, FileMode.Open, FileAccess.Read, FileShare.Read);
+                    var reader = new PakBuilder().Reader(stream);
+                    return (stream, reader);
+                }, trackAllValues: true)
+                : null;
+
+            string diskFullMessage = null;
+            object diskFullLock = new object();
+
+            try
+            {
+                Parallel.ForEach(files, new ParallelOptions { MaxDegreeOfParallelism = maxDegree }, (item, state) =>
+                {
+                    if (extractAllBackgroundWorker.CancellationPending)
+                    {
+                        state.Stop();
+                        return;
+                    }
+                    if (Volatile.Read(ref diskFullMessage) != null)
+                    {
+                        state.Stop();
+                        return;
+                    }
+
+                    try
+                    {
+                        FileStream stream = null;
+                        PakReader reader = null;
+                        if (threadLocalPak != null) (stream, reader) = threadLocalPak.Value;
+                        item.SaveFileToTemp(InteropType, outputDirectory, stream, reader);
+                    }
+                    catch (IOException ex) when (UAGUtils.IsDiskFullException(ex))
+                    {
+                        lock (diskFullLock) { diskFullMessage ??= ex.Message; }
+                        state.Stop();
+                        return;
+                    }
+                    catch
+                    {
+                        // Skip indiv failures so one bad file doesn't abort extraction of everything.
+                    }
+
+                    extractAllBackgroundWorker.ReportProgress(0);
+                });
+            }
+            finally
+            {
+                if (threadLocalPak != null)
+                {
+                    foreach (var pair in threadLocalPak.Values)
+                    {
+                        pair.reader?.Dispose();
+                        pair.stream?.Dispose();
+                    }
+                    threadLocalPak.Dispose();
+                }
             }
 
-            foreach (var entry in processingNode.Children)
-            {
-                if (extractAllBackgroundWorker.CancellationPending) break;
-                ExtractVisit(entry.Value, progressBarForm, stream2, reader2);
-            }
+            if (diskFullMessage != null) throw new IOException(diskFullMessage);
         }
 
         private ProgressBarForm progressBarForm;
+        private List<DirectoryTreeItem> extractionRoots;
+        private bool extractionIsWholeContainer;
+        private string extractionOutputDirectory;
+
         private void extractAllToolStripMenuItem_Click(object sender, EventArgs e)
         {
             if (!DirectoryTreeMap.TryGetValue(loadTreeView, out DirectoryTree loadedTree) || loadedTree == null)
@@ -925,27 +992,57 @@ namespace UAssetGUI
                 return;
             }
 
+            StartExtraction(loadedTree.RootNodes.Values.ToList(), isWholeContainer: true);
+        }
+
+        private string PromptForExtractionDestination()
+        {
+            using (var folderDialog = new FolderBrowserDialog())
+            {
+                folderDialog.Description = UAGConfig.GetString("FileContainerForm.Prompt.ChooseExtractFolder", returnNullIfFail: true) ?? "Choose a folder to extract to";
+                folderDialog.UseDescriptionForTitle = true;
+                folderDialog.ShowNewFolderButton = true;
+
+                string lastFolder = UAGConfig.Data.LastExtractFolder;
+                folderDialog.SelectedPath = !string.IsNullOrEmpty(lastFolder) && Directory.Exists(lastFolder)
+                    ? lastFolder
+                    : UAGConfig.ExtractedFolder;
+
+                if (folderDialog.ShowDialog(this) != DialogResult.OK) return null;
+
+                UAGConfig.Data.LastExtractFolder = folderDialog.SelectedPath;
+                UAGConfig.Save();
+
+                return folderDialog.SelectedPath;
+            }
+        }
+
+        public void StartExtraction(List<DirectoryTreeItem> roots, bool isWholeContainer)
+        {
+            if (extractAllBackgroundWorker.IsBusy) return;
+            if (roots == null || roots.Count == 0) return;
+
             switch (InteropType)
             {
                 case InteropType.Pak:
-                    if (extractAllBackgroundWorker.IsBusy) return;
-
-                    int numFiles = loadedTree.GetNumFiles();
-
-                    UAGUtils.InvokeUI(() =>
-                    {
-                        progressBarForm = new ProgressBarForm();
-                        progressBarForm.Value = 0;
-                        progressBarForm.Maximum = numFiles;
-                        progressBarForm.Text = this.Text;
-                        progressBarForm.BaseForm = this;
-                        progressBarForm.Show(this);
-                    });
-
-                    extractAllBackgroundWorker.RunWorkerAsync();
-                    break;
                 case InteropType.Retoc:
-                    if (extractAllBackgroundWorker.IsBusy) return;
+                    string destination = PromptForExtractionDestination();
+                    if (destination == null) return; // user cancelled the folder picker
+
+                    extractionRoots = roots;
+                    extractionIsWholeContainer = isWholeContainer;
+                    extractionOutputDirectory = destination;
+
+                    int numFiles = 0;
+                    foreach (var root in roots) numFiles += DirectoryTree.GetNumFilesInItem(root);
+
+                    progressBarForm = new ProgressBarForm();
+                    progressBarForm.Value = 0;
+                    progressBarForm.Maximum = Math.Max(numFiles, 1);
+                    progressBarForm.Text = this.Text;
+                    progressBarForm.BaseForm = this;
+                    progressBarForm.Show(this);
+
                     extractAllBackgroundWorker.RunWorkerAsync();
                     break;
                 default:
@@ -956,33 +1053,46 @@ namespace UAssetGUI
 
         private void extractAllBackgroundWorker_DoWork(object sender, DoWorkEventArgs e)
         {
-            Directory.CreateDirectory(UAGConfig.ExtractedFolder);
+            string outputDirectory = extractionOutputDirectory ?? UAGConfig.ExtractedFolder;
+            Directory.CreateDirectory(outputDirectory);
+
+            List<DirectoryTreeItem> roots = extractionRoots;
+            if (roots == null)
+            {
+                if (!DirectoryTreeMap.TryGetValue(loadTreeView, out DirectoryTree loadedTree) || loadedTree == null) throw new InvalidOperationException("No container loaded");
+                roots = loadedTree.RootNodes.Values.ToList();
+                extractionIsWholeContainer = true;
+            }
 
             switch (InteropType)
             {
                 case InteropType.Pak:
-                    if (!DirectoryTreeMap.TryGetValue(loadTreeView, out DirectoryTree loadedTree) || loadedTree == null) throw new InvalidOperationException("No container loaded");
-
-                    using (FileStream stream = new FileStream(this.CurrentContainerPath, FileMode.Open))
-                    {
-                        var reader = new PakBuilder().Reader(stream);
-                        foreach (var entry in loadedTree.RootNodes)
-                        {
-                            if (extractAllBackgroundWorker.CancellationPending) break;
-                            ExtractVisit(entry.Value, progressBarForm, stream, reader);
-                        }
-                    }
+                    ExtractManyParallel(roots, outputDirectory);
 
                     if (extractAllBackgroundWorker.CancellationPending)
                     {
                         e.Cancel = true;
                         return;
                     }
-                    UAGUtils.OpenDirectory(UAGConfig.ExtractedFolder);
+                    UAGUtils.OpenDirectory(outputDirectory);
                     break;
                 case InteropType.Retoc:
-                    FileContainerForm.SendCommandToRetoc($"{RetocExtraCommands} to-legacy \"{Path.GetDirectoryName(CurrentContainerPath)}\" \"{UAGConfig.ExtractedFolder}\"", out _, out _, true);
-                    UAGUtils.OpenDirectory(UAGConfig.ExtractedFolder);
+                    if (extractionIsWholeContainer)
+                    {
+                        // whole container extraction has a single fast path via retocss own recursive extractor
+                        FileContainerForm.SendCommandToRetoc($"{RetocExtraCommands} to-legacy \"{Path.GetDirectoryName(CurrentContainerPath)}\" \"{outputDirectory}\"", out _, out _, true);
+                    }
+                    else
+                    {
+                        ExtractManyParallel(roots, outputDirectory);
+
+                        if (extractAllBackgroundWorker.CancellationPending)
+                        {
+                            e.Cancel = true;
+                            return;
+                        }
+                    }
+                    UAGUtils.OpenDirectory(outputDirectory);
                     break;
             }
         }
@@ -1002,13 +1112,25 @@ namespace UAssetGUI
                 }
                 else if (e.Error != null)
                 {
-                    MessageBox.Show(string.Format(UAGConfig.GetString("FileContainerForm.Prompt.ExtractError"), e.Error.Message), BaseForm.DisplayVersion);
+                    if (e.Error is IOException ioEx && UAGUtils.IsDiskFullException(ioEx))
+                    {
+                        MessageBox.Show(
+                            $"Ran out of disk space while extracting (extracted {progressBarForm?.Value ?? 0} file(s) before stopping).\n\n" +
+                            $"Free up space on the drive holding \"{extractionOutputDirectory ?? UAGConfig.ExtractedFolder}\", or pick a different destination next time, then try again.\n\n{ioEx.Message}",
+                            BaseForm.DisplayVersion);
+                    }
+                    else
+                    {
+                        MessageBox.Show(string.Format(UAGConfig.GetString("FileContainerForm.Prompt.ExtractError"), e.Error.Message), BaseForm.DisplayVersion);
+                    }
                 }
                 else
                 {
                     MessageBox.Show(progressBarForm == null ? UAGConfig.GetString("Generic.Prompt.OperationCompleted") : string.Format(UAGConfig.GetString("FileContainerForm.Prompt.ExtractDoneCount"), progressBarForm.Value), BaseForm.DisplayVersion);
                 }
                 progressBarForm?.Close();
+                extractionRoots = null;
+                extractionOutputDirectory = null;
             });
         }
 
@@ -1099,10 +1221,18 @@ namespace UAssetGUI
                 tsmItem = new ToolStripMenuItem(UAGConfig.GetString("FileContainerForm.ContextMenu.Extract"));
                 tsmItem.Click += (sender, args) =>
                 {
-                    string outPath = UAGConfig.ExtractFile(Pointer, item.ParentForm.InteropType);
-                    if (outPath == null) return;
-                    if ((Path.GetExtension(outPath)?.Length ?? 0) > 0) outPath = Path.GetDirectoryName(outPath);
-                    UAGUtils.OpenDirectory(outPath);
+                    if (Pointer.IsFile)
+                    {
+                        string outPath = UAGConfig.ExtractFile(Pointer, item.ParentForm.InteropType);
+                        if (outPath == null) return;
+                        if ((Path.GetExtension(outPath)?.Length ?? 0) > 0) outPath = Path.GetDirectoryName(outPath);
+                        UAGUtils.OpenDirectory(outPath);
+                    }
+                    else
+                    {
+
+                        item.ParentForm.StartExtraction(new List<DirectoryTreeItem> { Pointer }, isWholeContainer: false);
+                    }
                 };
                 this.ContextMenuStrip.Items.Add(tsmItem);
                 tsmItem = new ToolStripMenuItem(UAGConfig.GetString("FileContainerForm.ContextMenu.Stage"));
@@ -1154,19 +1284,19 @@ namespace UAssetGUI
             }
         }
 
-        private static int GetNumFilesVisit(DirectoryTreeItem item)
+        public static int GetNumFilesInItem(DirectoryTreeItem item)
         {
             if (item.IsFile) return 1;
 
-            int numFiles = 0; // to count directories too, set to 1
-            foreach (var entry in item.Children) numFiles += GetNumFilesVisit(entry.Value);
+            int numFiles = 0;
+            foreach (var entry in item.Children) numFiles += GetNumFilesInItem(entry.Value);
             return numFiles;
         }
 
         public int GetNumFiles()
         {
             int numFiles = 0;
-            foreach (var entry in RootNodes) numFiles += GetNumFilesVisit(entry.Value);
+            foreach (var entry in RootNodes) numFiles += GetNumFilesInItem(entry.Value);
             return numFiles;
         }
 
